@@ -1,4 +1,4 @@
-"""HTTP access to the HW2 files stored in Cloud Storage."""
+"""Long-running Flask server for the HW2 files stored in Cloud Storage."""
 
 import json
 import mimetypes
@@ -7,9 +7,11 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from uuid import uuid4
 
-import functions_framework
+from flask import Flask, request
 from google.api_core.exceptions import NotFound
 from google.cloud import pubsub_v1, storage
+
+app = Flask(__name__)
 
 BUCKET_NAME = os.environ.get("BUCKET_NAME", "cs528hw2")
 OBJECT_PREFIX = os.environ.get("OBJECT_PREFIX", "pages").strip("/")
@@ -21,6 +23,8 @@ FORBIDDEN_COUNTRIES = {
     "Libya", "Sudan", "Zimbabwe", "Syria",
 }
 COUNTRY_LOOKUP = {country.casefold(): country for country in FORBIDDEN_COUNTRIES}
+CLOUD_LOGGING_ENABLED = os.environ.get("CLOUD_LOGGING_ENABLED", "false").lower() == "true"
+CLOUD_LOG_NAME = os.environ.get("CLOUD_LOG_NAME", "hw4-web-server")
 
 
 @lru_cache(maxsize=1)
@@ -34,23 +38,72 @@ def get_storage_client():
     return storage.Client()
 
 
-def log_http_error(request, event, status, message, **details):
-    """Emit both plain text and single-line JSON for managed Cloud Logging."""
-    print(message, flush=True)
-    print(json.dumps({
-        "severity": "ERROR",
+@lru_cache(maxsize=1)
+def get_cloud_logger():
+    # Lazy initialization keeps local use independent of Logging credentials.
+    from google.cloud import logging as cloud_logging
+    from google.cloud.logging_v2.resource import Resource
+
+    client = cloud_logging.Client()
+    instance_id = os.environ.get("HW4_INSTANCE_ID")
+    zone = os.environ.get("HW4_INSTANCE_ZONE")
+    if instance_id and zone:
+        resource = Resource(type="gce_instance", labels={
+            "project_id": client.project,
+            "instance_id": instance_id,
+            "zone": zone,
+        })
+        return client.logger(CLOUD_LOG_NAME, resource=resource)
+    return client.logger(CLOUD_LOG_NAME)
+
+
+def log_http_error(request, event, status, message, *, severity="ERROR", **details):
+    """Keep a local copy and explicitly send structured events to Cloud Logging."""
+    record = {
+        "severity": severity,
         "event": event,
         "message": message,
         "method": request.method,
         "path": request.path,
         "status": status,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         **details,
-    }), flush=True)
+    }
+    print(message, flush=True)
+    print(json.dumps(record), flush=True)
+    if CLOUD_LOGGING_ENABLED:
+        try:
+            # Set the LogEntry severity, not just a field inside jsonPayload.
+            # This synchronous call submits the event before responding.
+            get_cloud_logger().log_struct(record, severity=severity)
+        except Exception as exc:
+            # Preserve HTTP behavior if logging fails; diagnose through journal.
+            # Do not recursively call this helper from its own failure handler.
+            print(json.dumps({
+                "severity": "ERROR",
+                "event": "cloud_logging_failed",
+                "original_event": event,
+                "message": "Failed to write event to Cloud Logging.",
+                "error": str(exc),
+            }), flush=True)
 
 
-@functions_framework.http
-def main(request):
-    # Check before method dispatch, payload validation, or any GCS access.
+@app.before_request
+def reject_unsupported_methods():
+    # Run before routing, including Flask's automatic HEAD/OPTIONS handling.
+    if request.method not in {"GET", "POST"}:
+        log_http_error(
+            request, "unsupported_method", 501,
+            f"HTTP method not implemented: {request.method} {request.path!r}",
+        )
+        return {"error": "HTTP method not implemented."}, 501
+
+
+@app.route("/", methods=["GET", "POST"], provide_automatic_options=False)
+@app.route("/<path:filename_path>", methods=["GET", "POST"],
+           provide_automatic_options=False)
+def serve_file(filename_path=None):
+    # Check before payload validation or any GCS access.
     country = COUNTRY_LOOKUP.get(request.headers.get("X-country", "").strip().casefold())
     if country:
         # Extract only notification metadata; never access GCS for denied requests.
@@ -74,6 +127,7 @@ def main(request):
         }
         log_http_error(
             request, event["event"], 400, event["message"],
+            severity="CRITICAL",
             country=country, filename=filename, event_id=event["event_id"],
         )
         try:
@@ -103,19 +157,12 @@ def main(request):
         return {"error": "Permission denied", "country": country}, 400
 
     if request.method == "GET":
-        filename = request.path.lstrip("/")
-    elif request.method == "POST":
+        filename = filename_path
+    else:  # POST; all other methods are rejected by before_request.
         payload = request.get_json(silent=True)
         if not isinstance(payload, dict):
             return {"error": "Provide a JSON object containing filename."}, 400
         filename = payload.get("filename")
-    else:
-        log_http_error(
-            request, "unsupported_method", 501,
-            f"HTTP method not implemented: {request.method} {request.path!r}",
-        )
-        return {"error": "HTTP method not implemented."}, 501
-
     if not isinstance(filename, str) or not filename.strip():
         return {"error": "filename must be a non-empty string."}, 400
 
@@ -131,9 +178,14 @@ def main(request):
         log_http_error(
             request, "file_not_found", 404,
             f"File not found: {filename!r}",
+            severity="WARNING",
             filename=filename, bucket=BUCKET_NAME, object_name=object_name,
         )
         return {"error": "File not found."}, 404
 
     content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     return contents, 200, {"Content-Type": content_type}
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080, debug=False)

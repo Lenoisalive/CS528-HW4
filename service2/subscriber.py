@@ -1,4 +1,4 @@
-"""Local Pub/Sub subscriber that appends forbidden requests to one GCS log."""
+"""Pub/Sub subscriber for a VM or local use, with stdout and a deduplicated GCS log."""
 
 import argparse
 import json
@@ -8,6 +8,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
+import google.auth
 from google.api_core.exceptions import NotFound, PreconditionFailed
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
@@ -21,10 +22,19 @@ SERVICE_ACCOUNT = os.environ.get(
 SUBSCRIPTION_ID = os.environ.get("SUBSCRIPTION_ID", "forbidden-requests-sub")
 BUCKET_NAME = os.environ.get("BUCKET_NAME", "cs528hw2")
 LOG_OBJECT = os.environ.get("LOG_OBJECT", "forbidden_requests/log.txt")
+AUTH_MODE = os.environ.get("AUTH_MODE", "impersonation").lower()
 
 
 def make_credentials():
-    """Refresh short-lived SA tokens through gcloud, without keys or user ADC."""
+    """Use the VM's attached identity, or preserve HW3 local impersonation."""
+    if AUTH_MODE == "adc":
+        credentials, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        return credentials
+    if AUTH_MODE != "impersonation":
+        raise ValueError("AUTH_MODE must be 'adc' or 'impersonation'.")
+
     def refresh_token(request, scopes=None):
         started = datetime.now(timezone.utc).replace(tzinfo=None)
         try:
@@ -112,6 +122,9 @@ def make_callback(bucket):
         try:
             event = json.loads(message.data.decode("utf-8"))
             marker, record = format_record(event, message.message_id)
+            # Escape untrusted values so the notification remains on one line.
+            country = json.dumps(event["country"], ensure_ascii=True)[1:-1]
+            print(f"CRITICAL: Forbidden request from {country}", flush=True)
             print(record, end="", flush=True)
             appended = append_record(bucket, marker, record)
         except Exception as exc:
@@ -131,14 +144,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--check-auth", action="store_true",
-        help="Acquire an impersonated token without consuming messages or writing GCS.",
+        help="Check credentials without consuming messages or writing GCS.",
     )
     args = parser.parse_args()
     credentials = make_credentials()
     if args.check_auth:
         credentials.refresh(Request())
-        print(f"Impersonation token acquired for: {SERVICE_ACCOUNT}")
-        print(f"Local refresh deadline (UTC): {credentials.expiry.isoformat()}Z")
+        print(f"Credentials acquired using authentication mode: {AUTH_MODE}")
+        if AUTH_MODE == "impersonation":
+            print(f"Impersonated identity: {SERVICE_ACCOUNT}")
+        if credentials.expiry is not None:
+            print(f"Credential expiry (UTC): {credentials.expiry.isoformat()}")
         print("Token is not displayed. Pub/Sub and GCS permissions are not checked here.")
         return
     storage_client = storage.Client(project=PROJECT_ID, credentials=credentials)
@@ -150,7 +166,7 @@ def main():
             flow_control=pubsub_v1.types.FlowControl(max_messages=1),
             await_callbacks_on_shutdown=True,
         )
-        print(f"Listening: {subscription}\nIdentity: {SERVICE_ACCOUNT}\n"
+        print(f"Listening: {subscription}\nAuthentication mode: {AUTH_MODE}\n"
               f"Log: gs://{BUCKET_NAME}/{LOG_OBJECT}", flush=True)
         try:
             future.result()
